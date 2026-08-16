@@ -50,4 +50,18 @@ cat hosts.txt | rusolver
 ```
 cat hosts.txt | rusolver -i
 ```
-You can tune the `--timeout` and `-t/--threads` options according to your needs. See `rusolver --help`
+* By default only A records are looked up. To ask for AAAA instead, or for both:
+```
+cat hosts.txt | rusolver -i --ip-version v6
+cat hosts.txt | rusolver -i --ip-version both
+```
+* A resolvers file takes one address per line. Blank lines and `#` comments are
+  skipped, and an entry may carry its own port:
+```
+1.1.1.1
+8.8.8.8
+127.0.0.1:5353
+```
+`-q/--quiet` suppresses the progress commentary; the resolved hosts are still
+printed. You can tune the `--timeout` and `-t/--threads` options according to
+your needs. See `rusolver --help`

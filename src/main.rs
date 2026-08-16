@@ -1,75 +1,94 @@
 use {
     clap::Parser,
     rusolver::{args::Args, dnslib, structs, utils},
-    std::collections::HashSet,
-    tokio::{
-        self,
-        io::{self, AsyncReadExt},
-    },
+    std::{collections::HashSet, process::ExitCode},
+    tokio::io::{self, AsyncReadExt},
 };
 
-// WIP: add support for AAAA, TXT, SRV, NAPTR, PTR, CNAME, DNAME, MX, NS, SOA, LOC, SVCB, HTTPS, SPF, CAA and AVC resource records.
-// This could use a new command line option such as -t, e.g. echo www.example.com | rusolver -i -t AAAA. It might also make sense
-// to change -i/--ip to -d/--data with the text Display the record data.
+// WIP: add support for TXT, SRV, NAPTR, PTR, DNAME, MX, NS, SOA, LOC, SVCB,
+// HTTPS, SPF, CAA and AVC resource records, selected with a -t/--type option.
+
+/// Resolvers used when none are given, and always used to confirm answers.
+const BUILT_IN_NAMESERVERS: [&str; 10] = [
+    // Cloudflare
+    "1.1.1.1:53",
+    "1.0.0.1:53",
+    // Google
+    "8.8.8.8:53",
+    "8.8.4.4:53",
+    // Quad9
+    "9.9.9.9:53",
+    "149.112.112.112:53",
+    // OpenDNS
+    "208.67.222.222:53",
+    "208.67.220.220:53",
+    // Verisign
+    "64.6.64.6:53",
+    "64.6.65.6:53",
+];
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Eval args
+async fn main() -> ExitCode {
+    match run().await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(message) => {
+            eprintln!("{message}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run() -> Result<(), String> {
     let args = Args::parse();
+    let ip_version = args.ip_version.into();
+    let options = utils::return_resolver_opts(args.timeout, args.retries, ip_version);
 
-    // Resolver opts
-    let options = utils::return_resolver_opts(args.timeout, args.retries);
+    let built_in: HashSet<String> = BUILT_IN_NAMESERVERS
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
 
-    let built_in_nameservers: HashSet<String> = vec![
-        // Cloudflare
-        "1.1.1.1:53",
-        "1.0.0.1:53",
-        // Google
-        "8.8.8.8:53",
-        "8.8.4.4:53",
-        // Quad9
-        "9.9.9.9:53",
-        "149.112.112.112:53",
-        // OpenDNS
-        "208.67.222.222:53",
-        "208.67.220.220:53",
-        // Verisign
-        "64.6.64.6:53",
-        "64.6.65.6:53",
-    ]
-    .iter()
-    .map(ToString::to_string)
-    .collect();
-
-    // Create resolvers
-    let mut nameserver_ips;
-
-    if args.resolvers.is_some() {
-        nameserver_ips = utils::return_file_lines(&args.resolvers.unwrap()).await;
-        nameserver_ips.retain(|ip| !ip.is_empty());
-    } else {
-        nameserver_ips = built_in_nameservers.clone();
+    let nameserver_ips = match args.resolvers.as_deref() {
+        Some(path) => utils::return_file_lines(path)
+            .await
+            .map_err(|e| format!("Error reading the resolvers file {path}: {e}"))?,
+        None => built_in.clone(),
+    };
+    if nameserver_ips.is_empty() {
+        return Err("The resolvers file did not contain any usable address.".to_owned());
     }
 
-    let resolvers = dnslib::return_tokio_asyncresolver(&nameserver_ips, options.clone());
-    let trustable_resolvers = dnslib::return_tokio_asyncresolver(&built_in_nameservers, options);
-    let mut wildcard_ips = HashSet::new();
+    let resolvers = dnslib::return_tokio_asyncresolver(&nameserver_ips, options.clone())
+        .map_err(|e| e.to_string())?;
+    let trustable_resolvers =
+        dnslib::return_tokio_asyncresolver(&built_in, options).map_err(|e| e.to_string())?;
 
-    // Read stdin
     let mut buffer = String::new();
-    let mut stdin = io::stdin();
-    stdin.read_to_string(&mut buffer).await?;
+    io::stdin()
+        .read_to_string(&mut buffer)
+        .await
+        .map_err(|e| format!("Error reading standard input: {e}"))?;
 
-    let hosts: HashSet<String> = if args.domain.is_some() {
-        let domain = args.domain.unwrap();
-        wildcard_ips =
-            utils::detect_wildcards(&domain, &trustable_resolvers, args.quiet_flag).await;
-        buffer
+    let mut wildcard_ips = HashSet::new();
+    let hosts: HashSet<String> = match args.domain.as_deref() {
+        Some(domain) => {
+            // The same resolvers that will do the work: a wildcard address is
+            // only meaningful for the view of DNS this run actually queries.
+            wildcard_ips =
+                utils::detect_wildcards(domain, &resolvers, ip_version, args.quiet_flag).await;
+            buffer
+                .lines()
+                .map(str::trim)
+                .filter(|word| !word.is_empty())
+                .map(|word| format!("{word}.{domain}"))
+                .collect()
+        }
+        None => buffer
             .lines()
-            .map(|word| format!("{word}.{domain}"))
-            .collect()
-    } else {
-        buffer.lines().map(str::to_owned).collect()
+            .map(str::trim)
+            .filter(|host| !host.is_empty())
+            .map(str::to_owned)
+            .collect(),
     };
 
     let options = structs::LibOptions {
@@ -79,11 +98,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         wildcard_ips,
         enable_double_check: args.enable_double_check,
         threads: args.threads,
+        ip_version,
         show_ip_address: args.ip,
+        print_results: true,
         quiet_flag: args.quiet_flag,
     };
 
     dnslib::return_hosts_data(&options).await;
-
     Ok(())
 }
